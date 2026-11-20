@@ -4,17 +4,17 @@ import json
 import math
 import os
 import sqlite3
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-DB_PATH = "/data/stream_state.db"
+DB_PATH = os.getenv("STREAM_DB_PATH", "/data/stream_state.db")
 DEVICE_SECRET = os.getenv("DEVICE_SECRET", "agrotrack-edge-secret-key")
-TEMP_THRESHOLD = 5.0
-WINDOW_MINUTES = 10.0
+TEMP_THRESHOLD = float(os.getenv("TEMP_THRESHOLD", "5.0"))
+WINDOW_MINUTES = float(os.getenv("WINDOW_MINUTES", "10.0"))
+ESCALATION_TIMEOUT_SECONDS = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "180"))
 
 app = FastAPI(title="AgroTrack-IoT Stream Processor")
 
@@ -33,6 +33,11 @@ class TelemetryEvent(BaseModel):
     prev_hash: str = "GENESIS"
     signature: str = ""
     gateway_sent_at: Optional[str] = None
+
+
+class AlertAckRequest(BaseModel):
+    acknowledged_by: str = "operator-central"
+    notes: Optional[str] = None
 
 
 def init_db() -> None:
@@ -70,8 +75,12 @@ def init_db() -> None:
                 window_start TEXT NOT NULL,
                 window_end TEXT NOT NULL,
                 max_temp REAL NOT NULL,
-                escalation_after_min INTEGER NOT NULL DEFAULT 3,
+                escalation_after_sec INTEGER NOT NULL DEFAULT 180,
                 status TEXT NOT NULL DEFAULT 'PENDING_ACK',
+                acknowledged_by TEXT,
+                acknowledged_at TEXT,
+                escalated_to TEXT,
+                escalated_at TEXT,
                 latency_ms REAL NOT NULL
             )
             """
@@ -148,6 +157,50 @@ def evaluate_10min_window(
     return None
 
 
+def run_escalation_check(
+    conn: sqlite3.Connection, override_seconds: Optional[int] = None
+) -> list[dict]:
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    pending = conn.execute(
+        """
+        SELECT alert_id, triggered_at, escalation_after_sec, trip_id, device_id
+        FROM alerts
+        WHERE status = 'PENDING_ACK'
+        """
+    ).fetchall()
+
+    escalated = []
+    for alert_id, triggered_at, configured_sec, trip_id, device_id in pending:
+        threshold_sec = (
+            override_seconds if override_seconds is not None else configured_sec
+        )
+        elapsed_sec = (now_dt - parse_iso(triggered_at)).total_seconds()
+        if elapsed_sec >= threshold_sec:
+            conn.execute(
+                """
+                UPDATE alerts
+                SET status = 'ESCALATED_TO_COORDINATOR',
+                    escalated_to = 'logistics-coordinator',
+                    escalated_at = ?
+                WHERE alert_id = ?
+                """,
+                (now_iso, alert_id),
+            )
+            escalated.append(
+                {
+                    "alert_id": alert_id,
+                    "trip_id": trip_id,
+                    "device_id": device_id,
+                    "elapsed_seconds": round(elapsed_sec, 2),
+                    "threshold_seconds": threshold_sec,
+                    "escalated_to": "logistics-coordinator",
+                    "escalated_at": now_iso,
+                }
+            )
+    return escalated
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -166,11 +219,16 @@ def health() -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         alerts_cnt = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        escalated_cnt = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE status = 'ESCALATED_TO_COORDINATOR'"
+        ).fetchone()[0]
     return {
         "service": "stream-processor",
         "status": "ok",
         "stored_events": total,
         "total_alerts": alerts_cnt,
+        "escalated_alerts": escalated_cnt,
+        "default_escalation_seconds": ESCALATION_TIMEOUT_SECONDS,
     }
 
 
@@ -239,8 +297,8 @@ def ingest_event(ev: TelemetryEvent) -> dict:
                         INSERT INTO alerts (
                             alert_id, tenant_id, device_id, trip_id,
                             triggered_at, window_start, window_end,
-                            max_temp, escalation_after_min, status, latency_ms
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 3, 'PENDING_ACK', ?)
+                            max_temp, escalation_after_sec, status, latency_ms
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ACK', ?)
                         """,
                         (
                             alert_id,
@@ -251,13 +309,15 @@ def ingest_event(ev: TelemetryEvent) -> dict:
                             win["window_start"],
                             win["window_end"],
                             win["max_temp"],
+                            ESCALATION_TIMEOUT_SECONDS,
                             alert_latency_ms,
                         ),
                     )
                     alert_triggered = {
                         "alert_id": alert_id,
                         "max_temp": win["max_temp"],
-                        "escalation_after_min": 3,
+                        "status": "PENDING_ACK",
+                        "escalation_after_sec": ESCALATION_TIMEOUT_SECONDS,
                         "latency_ms": alert_latency_ms,
                         "within_5s_sla": alert_latency_ms <= 5000.0,
                     }
@@ -270,6 +330,51 @@ def ingest_event(ev: TelemetryEvent) -> dict:
         "signature_valid": sig_valid,
         "processing_latency_ms": latency_ms,
         "alert": alert_triggered,
+    }
+
+
+@app.post("/alerts/{alert_id}/ack")
+def acknowledge_alert(alert_id: str, req: AlertAckRequest) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT status FROM alerts WHERE alert_id = ?", (alert_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alerta no encontrada")
+        if row[0] == "ESCALATED_TO_COORDINATOR":
+            return {
+                "alert_id": alert_id,
+                "status": row[0],
+                "message": "La alerta ya había sido escalada al coordinador.",
+            }
+        conn.execute(
+            """
+            UPDATE alerts
+            SET status = 'ACKNOWLEDGED',
+                acknowledged_by = ?,
+                acknowledged_at = ?
+            WHERE alert_id = ?
+            """,
+            (req.acknowledged_by, now_iso, alert_id),
+        )
+        conn.commit()
+    return {
+        "alert_id": alert_id,
+        "status": "ACKNOWLEDGED",
+        "acknowledged_by": req.acknowledged_by,
+        "acknowledged_at": now_iso,
+    }
+
+
+@app.post("/alerts/check-escalation")
+def check_escalation(force_seconds: Optional[int] = None) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        escalated = run_escalation_check(conn, override_seconds=force_seconds)
+        conn.commit()
+    return {
+        "escalated_count": len(escalated),
+        "escalated_alerts": escalated,
     }
 
 
@@ -292,8 +397,10 @@ def get_trip_events(trip_id: str) -> dict:
 
 
 @app.get("/alerts")
-def get_alerts() -> dict:
+def get_alerts(force_seconds: Optional[int] = None) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
+        run_escalation_check(conn, override_seconds=force_seconds)
+        conn.commit()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM alerts ORDER BY triggered_at DESC"

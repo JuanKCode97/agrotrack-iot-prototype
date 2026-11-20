@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-DB_PATH = "/data/gateway_buffer.db"
+DB_PATH = os.getenv("GATEWAY_DB_PATH", "/data/gateway_buffer.db")
 STREAM_PROCESSOR_URL = os.getenv("STREAM_PROCESSOR_URL", "http://localhost:8001")
 CERT_SERVICE_URL = os.getenv("CERT_SERVICE_URL", "http://localhost:8002")
 DEVICE_SECRET = os.getenv("DEVICE_SECRET", "agrotrack-edge-secret-key")
@@ -43,6 +43,10 @@ class BurstRequest(BaseModel):
     trip_id: str = "trip-2026-11-19-a"
     count: int = 25
     temperature: float = 6.2
+    humidity: float = 78.5
+    lat: float = 4.5794
+    lon: float = -74.2168
+    door_open: bool = False
     step_seconds: int = 30
     start_minutes_ago: int = 15
 
@@ -268,6 +272,10 @@ async def simulate_burst(req: BurstRequest) -> dict:
                 device_id=req.device_id,
                 trip_id=req.trip_id,
                 temperature=req.temperature,
+                humidity=req.humidity,
+                lat=req.lat,
+                lon=req.lon,
+                door_open=req.door_open,
                 event_timestamp=ts,
             )
         )
