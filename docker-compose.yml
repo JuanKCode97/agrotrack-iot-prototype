@@ -1,0 +1,48 @@
+services:
+  stream-processor:
+    build: ./stream_processor
+    container_name: agrotrack_stream_processor
+    ports:
+      - "8001:8001"
+    volumes:
+      - processor_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  cert-service:
+    build: ./cert_service
+    container_name: agrotrack_cert_service
+    ports:
+      - "8002:8002"
+    volumes:
+      - cert_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway-sim:
+    build: ./gateway_sim
+    container_name: agrotrack_gateway_sim
+    ports:
+      - "8003:8003"
+    environment:
+      - STREAM_PROCESSOR_URL=http://stream-processor:8001
+      - CERT_SERVICE_URL=http://cert-service:8002
+      - DEVICE_SECRET=agrotrack-edge-secret-key
+    volumes:
+      - gateway_data:/data
+    depends_on:
+      stream-processor:
+        condition: service_healthy
+      cert-service:
+        condition: service_healthy
+
+volumes:
+  processor_data:
+  cert_data:
+  gateway_data:
