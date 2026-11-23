@@ -1,3 +1,13 @@
+"""
+Procesador de Flujos (Stream Processor - AgroTrack-IoT).
+
+Recibe lecturas de telemetría desde los gateways o simuladores, aplica control
+de idempotencia por `event_id`, verifica la firma HMAC canónica, ordena y
+evalúa excursiones térmicas en ventanas basadas en `event_timestamp` (tiempo de
+evento), gestiona alertas con reconocimiento o escalamiento al coordinador y
+expone métricas de latencia en milisegundos.
+"""
+
 import hashlib
 import hmac
 import json
@@ -10,16 +20,20 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+# Configuración por variables de entorno para adaptar persistencia, seguridad y umbrales sin tocar código.
 DB_PATH = os.getenv("STREAM_DB_PATH", "/data/stream_state.db")
 DEVICE_SECRET = os.getenv("DEVICE_SECRET", "agrotrack-edge-secret-key")
 TEMP_THRESHOLD = float(os.getenv("TEMP_THRESHOLD", "5.0"))
 WINDOW_MINUTES = float(os.getenv("WINDOW_MINUTES", "10.0"))
+# Tiempo por defecto (180 s = 3 min) tras el cual una alerta sin confirmar escala al coordinador logístico.
 ESCALATION_TIMEOUT_SECONDS = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "180"))
 
 app = FastAPI(title="AgroTrack-IoT Stream Processor")
 
 
 class TelemetryEvent(BaseModel):
+    """Contrato de entrada de una lectura de telemetría enviada por un gateway o simulador."""
+
     event_id: str
     tenant_id: str
     device_id: str
@@ -36,11 +50,14 @@ class TelemetryEvent(BaseModel):
 
 
 class AlertAckRequest(BaseModel):
+    """Datos enviados por el operador al reconocer una alerta activa."""
+
     acknowledged_by: str = "operator-central"
     notes: Optional[str] = None
 
 
 def init_db() -> None:
+    """Crea la carpeta de persistencia y las tablas `events` y `alerts` si aún no existen."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -89,6 +106,7 @@ def init_db() -> None:
 
 
 def verify_signature(ev: TelemetryEvent) -> bool:
+    """Valida el HMAC-SHA256 del evento usando serialización JSON canónica y comparación segura."""
     if not ev.signature:
         return False
     body = {
@@ -103,6 +121,7 @@ def verify_signature(ev: TelemetryEvent) -> bool:
         "lon": ev.lon,
         "door_open": ev.door_open,
     }
+    # `sort_keys=True` y separadores compactos aseguran que emisor y verificador serialicen idénticamente.
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     message = f"{ev.prev_hash}|{canonical}".encode("utf-8")
     expected = hmac.new(
@@ -112,6 +131,7 @@ def verify_signature(ev: TelemetryEvent) -> bool:
 
 
 def parse_iso(ts: str) -> datetime:
+    """Convierte una marca de tiempo ISO-8601 a `datetime` consciente de zona horaria en UTC."""
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -121,6 +141,12 @@ def parse_iso(ts: str) -> datetime:
 def evaluate_10min_window(
     conn: sqlite3.Connection, tenant_id: str, device_id: str, trip_id: str
 ) -> Optional[dict]:
+    """Evalúa si existe una racha continua por encima de `TEMP_THRESHOLD` mayor a `WINDOW_MINUTES`.
+
+    Ordena las lecturas del trayecto por `event_timestamp` (tiempo de evento) para que incluso
+    lecturas enviadas tras una desconexión o fuera de orden se evalúen según cuándo ocurrieron.
+    Si una lectura cae por debajo o igual al umbral, corta la racha continua actual.
+    """
     rows = conn.execute(
         """
         SELECT event_timestamp, temperature
@@ -141,6 +167,7 @@ def evaluate_10min_window(
         end_dt = start_dt
         for j in range(i + 1, n):
             curr_dt, curr_temp = readings[j]
+            # Interrumpe la excursión continua si la temperatura vuelve a niveles seguros (`<= TEMP_THRESHOLD`).
             if curr_temp <= TEMP_THRESHOLD:
                 break
             if curr_dt > end_dt:
@@ -160,6 +187,11 @@ def evaluate_10min_window(
 def run_escalation_check(
     conn: sqlite3.Connection, override_seconds: Optional[int] = None
 ) -> list[dict]:
+    """Revisa alertas en estado `PENDING_ACK` y escala al coordinador si superan el tiempo límite.
+
+    Admite `override_seconds` (por ejemplo, `force_seconds` en la demo o pruebas) para validar el
+    escalamiento sin esperar 180 segundos en tiempo real.
+    """
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     pending = conn.execute(
@@ -202,6 +234,7 @@ def run_escalation_check(
 
 
 def percentile(values: list[float], p: float) -> float:
+    """Calcula el percentil `p` (por ejemplo 50, 95 o 99) sobre una lista de latencias."""
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -211,11 +244,13 @@ def percentile(values: list[float], p: float) -> float:
 
 @app.on_event("startup")
 def on_startup() -> None:
+    """Inicializa la base de datos al arrancar el microservicio."""
     init_db()
 
 
 @app.get("/health")
 def health() -> dict:
+    """Entrega estado operativo y contadores resumidos de eventos y alertas."""
     with sqlite3.connect(DB_PATH) as conn:
         total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         alerts_cnt = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
@@ -234,10 +269,19 @@ def health() -> dict:
 
 @app.post("/ingest")
 def ingest_event(ev: TelemetryEvent) -> dict:
+    """Ingesta un evento de telemetría con deduplicación, validación de firma y evaluación de ventana.
+
+    1. Verifica la firma HMAC.
+    2. Ignora duplicados si `event_id` ya existe en `events`.
+    3. Persiste el evento junto con su latencia de procesamiento en milisegundos.
+    4. Si la firma es válida y `temperature > TEMP_THRESHOLD`, evalúa la ventana de 10 minutos
+       y dispara una alerta única por `window_start` si aún no existe.
+    """
     t0 = datetime.now(timezone.utc)
     sig_valid = verify_signature(ev)
 
     with sqlite3.connect(DB_PATH) as conn:
+        # Clave primaria `event_id`: garantiza idempotencia ante reintentos o retransmisiones duplicadas.
         exists = conn.execute(
             "SELECT 1 FROM events WHERE event_id = ?", (ev.event_id,)
         ).fetchone()
@@ -275,11 +319,13 @@ def ingest_event(ev: TelemetryEvent) -> dict:
         )
 
         alert_triggered = None
+        # Solo dispara alertas de excursión térmica sobre eventos cuya firma es válida.
         if sig_valid and ev.temperature > TEMP_THRESHOLD:
             win = evaluate_10min_window(
                 conn, ev.tenant_id, ev.device_id, ev.trip_id
             )
             if win:
+                # Evita generar múltiples alertas repetidas para la misma ventana de inicio (`window_start`).
                 existing_alert = conn.execute(
                     """
                     SELECT alert_id FROM alerts
@@ -335,6 +381,7 @@ def ingest_event(ev: TelemetryEvent) -> dict:
 
 @app.post("/alerts/{alert_id}/ack")
 def acknowledge_alert(alert_id: str, req: AlertAckRequest) -> dict:
+    """Registra el reconocimiento operativo de una alerta si aún no fue escalada."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -369,6 +416,7 @@ def acknowledge_alert(alert_id: str, req: AlertAckRequest) -> dict:
 
 @app.post("/alerts/check-escalation")
 def check_escalation(force_seconds: Optional[int] = None) -> dict:
+    """Ejecuta explícitamente la verificación de escalamiento de alertas pendientes."""
     with sqlite3.connect(DB_PATH) as conn:
         escalated = run_escalation_check(conn, override_seconds=force_seconds)
         conn.commit()
@@ -380,6 +428,7 @@ def check_escalation(force_seconds: Optional[int] = None) -> dict:
 
 @app.get("/events/{trip_id}")
 def get_trip_events(trip_id: str) -> dict:
+    """Devuelve los eventos de un trayecto ordenados cronológicamente por `event_timestamp`."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -398,6 +447,7 @@ def get_trip_events(trip_id: str) -> dict:
 
 @app.get("/alerts")
 def get_alerts(force_seconds: Optional[int] = None) -> dict:
+    """Evalúa escalamientos pendientes, persiste cambios y lista todas las alertas."""
     with sqlite3.connect(DB_PATH) as conn:
         run_escalation_check(conn, override_seconds=force_seconds)
         conn.commit()
@@ -410,6 +460,7 @@ def get_alerts(force_seconds: Optional[int] = None) -> dict:
 
 @app.get("/metrics")
 def get_metrics() -> dict:
+    """Calcula percentiles p50, p95 y p99 de latencia de ingesta y generación de alertas."""
     with sqlite3.connect(DB_PATH) as conn:
         lat_rows = conn.execute(
             "SELECT processing_latency_ms FROM events"

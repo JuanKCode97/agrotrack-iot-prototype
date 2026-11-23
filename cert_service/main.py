@@ -1,3 +1,12 @@
+"""
+Servicio de Certificación y Pagos (AgroTrack-IoT).
+
+Materializa la cadena de custodia, la verificación criptográfica de firmas y el
+encadenamiento de hashes sobre los eventos de un trayecto, emitiendo certificados
+PDF verificables y registrando hallazgos en la bitácora de auditoría conforme a
+los principios de integridad y no repudio de la Ley 527 de 1999.
+"""
+
 import hashlib
 import hmac
 import json
@@ -12,23 +21,33 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+# Configuración inyectada por variables de entorno en Docker Compose 
+# (con valores por defecto seguros para pruebas).
 DB_PATH = os.getenv("CERT_DB_PATH", "/data/certificates.db")
 PDF_DIR = os.getenv("CERT_PDF_DIR", "/data/certs_pdf")
 STREAM_PROCESSOR_URL = os.getenv(
     "STREAM_PROCESSOR_URL", "http://stream-processor:8001"
 )
+# Clave compartida en el prototipo para verificar el HMAC generado en el borde 
+# (en producción se migra a claves asimétricas/mTLS).
 DEVICE_SECRET = os.getenv("DEVICE_SECRET", "agrotrack-edge-secret-key")
+# Umbral térmico comercial del comprador 
+# (4.0 °C), distinto de la regla operativa de alerta (> 5 °C por > 10 min).
 MAX_CERTIFIED_TEMP = float(os.getenv("MAX_CERTIFIED_TEMP", "4.0"))
 
 app = FastAPI(title="AgroTrack-IoT Certificate Service")
 
 
 class CertificateRequest(BaseModel):
+    """Carga útil para solicitar la emisión y verificación de un certificado por trayecto."""
+
     trip_id: str
     buyer_name: str = "International Cold-Chain Buyer"
 
 
 class PaymentCheckoutRequest(BaseModel):
+    """Carga útil para procesar el pago simulado asociado a un certificado emitido."""
+
     cert_id: str
     amount_usd: float = 15.0
     payment_method: str = "CARD_GATEWAY_SIM"
@@ -36,9 +55,14 @@ class PaymentCheckoutRequest(BaseModel):
 
 
 def build_simple_pdf_bytes(lines: list[str]) -> bytes:
-    """Genera un PDF válido sin requerir librerías externas."""
+    """Genera un PDF válido en formato PDF-1.4 sin requerir librerías externas.
+
+    Escapa caracteres especiales del contenido PDF y construye el catálogo, páginas,
+    fuente Helvetica, flujo de texto, tabla de referencias cruzadas (xref) y tráiler.
+    """
     escaped = []
     for line in lines:
+        # Escapa paréntesis/barras invertidas y reemplaza el símbolo de grado para compatibilidad Latin-1.
         clean = (
             line.replace("\\", "\\\\")
             .replace("(", "\\(")
@@ -87,6 +111,10 @@ def build_simple_pdf_bytes(lines: list[str]) -> bytes:
 
 
 def init_db() -> None:
+    """Inicializa directorios de persistencia y tablas relacionales del servicio de certificación.
+
+    Crea las tablas `certificates`, `audit_log` y `payments` si aún no existen.
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -138,6 +166,11 @@ def init_db() -> None:
 
 
 def verify_event_hmac(ev: dict) -> bool:
+    """Recalcula el HMAC-SHA256 canónico del evento y lo compara en tiempo constante.
+
+    Usa `hmac.compare_digest` para evitar ataques de temporización al validar la firma
+    generada en el borde sobre `prev_hash` y el cuerpo canónico del evento.
+    """
     sig = ev.get("signature", "")
     prev_hash = ev.get("prev_hash", "")
     if not sig or not prev_hash:
@@ -154,6 +187,7 @@ def verify_event_hmac(ev: dict) -> bool:
         "lon": ev["lon"],
         "door_open": bool(ev["door_open"]),
     }
+    # Serialización canónica con claves ordenadas y sin espacios para reproducir el mismo mensaje firmado.
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     message = f"{prev_hash}|{canonical}".encode("utf-8")
     expected = hmac.new(
@@ -164,11 +198,13 @@ def verify_event_hmac(ev: dict) -> bool:
 
 @app.on_event("startup")
 def on_startup() -> None:
+    """Hook de inicio de FastAPI que garantiza que la base SQLite y la carpeta de PDFs existan."""
     init_db()
 
 
 @app.get("/health")
 def health() -> dict:
+    """Endpoint de verificación de estado y conteo acumulado de certificados, auditorías y pagos."""
     with sqlite3.connect(DB_PATH) as conn:
         certs = conn.execute("SELECT COUNT(*) FROM certificates").fetchone()[0]
         audits = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
@@ -184,6 +220,16 @@ def health() -> dict:
 
 @app.post("/certificates/generate")
 async def generate_certificate(req: CertificateRequest) -> dict:
+    """Consulta los eventos de un trayecto, audita integridad y emite un certificado.
+
+    Flujo principal:
+    1. Obtiene los eventos del `trip_id` desde `stream-processor`.
+    2. Verifica HMAC y encadenamiento secuencial de hashes (`prev_hash`) evento a evento.
+    3. Si hay alteración, registra hallazgos en `audit_log` y marca `INVALIDATED_TAMPERING_DETECTED`
+       sin generar PDF válido.
+    4. Si la cadena está íntegra, evalúa `MAX_CERTIFIED_TEMP` (4.0 °C), genera el PDF y persiste
+       el certificado con hash SHA-256.
+    """
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             resp = await client.get(f"{STREAM_PROCESSOR_URL}/events/{req.trip_id}")
@@ -213,6 +259,7 @@ async def generate_certificate(req: CertificateRequest) -> dict:
         for idx, ev in enumerate(events):
             temps.append(ev["temperature"])
             sig_ok = verify_event_hmac(ev) and bool(ev.get("signature_valid", 1))
+            # A partir del segundo evento, `prev_hash` debe coincidir con el enlace calculado del evento anterior.
             chain_ok = True if idx == 0 else (ev.get("prev_hash") == expected_prev)
 
             if not sig_ok or not chain_ok:
@@ -231,6 +278,7 @@ async def generate_certificate(req: CertificateRequest) -> dict:
                     ),
                 )
 
+            # Calcula el hash encadenado esperado para validar la continuidad del siguiente evento.
             expected_prev = hashlib.sha256(
                 f"{ev['prev_hash']}|{ev['signature']}".encode("utf-8")
             ).hexdigest()
@@ -263,6 +311,7 @@ async def generate_certificate(req: CertificateRequest) -> dict:
         device_id = events[0]["device_id"]
 
         pdf_path = None
+        # Solo emite el archivo PDF si no se detectó alteración o ruptura criptográfica en los eventos.
         if status != "INVALIDATED_TAMPERING_DETECTED":
             pdf_bytes = build_simple_pdf_bytes(
                 [
@@ -329,6 +378,7 @@ async def generate_certificate(req: CertificateRequest) -> dict:
 
 @app.get("/certificates/{cert_id}/pdf")
 def download_certificate_pdf(cert_id: str) -> Response:
+    """Descarga el archivo PDF generado para un certificado válido (no invalidado por alteración)."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT status, pdf_path FROM certificates WHERE cert_id = ?",
@@ -353,6 +403,7 @@ def download_certificate_pdf(cert_id: str) -> Response:
 
 @app.post("/payments/checkout")
 def checkout_payment(req: PaymentCheckoutRequest) -> dict:
+    """Registra un pago simulado aprobado para un certificado que no esté invalidado por manipulación."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         cert_row = conn.execute(
@@ -360,6 +411,7 @@ def checkout_payment(req: PaymentCheckoutRequest) -> dict:
         ).fetchone()
         if not cert_row:
             raise HTTPException(status_code=404, detail="Certificado no encontrado")
+        # Bloquea pagos sobre certificados alterados para mantener coherencia de integridad comercial y legal.
         if cert_row[0] == "INVALIDATED_TAMPERING_DETECTED":
             raise HTTPException(
                 status_code=400,
@@ -404,6 +456,7 @@ def checkout_payment(req: PaymentCheckoutRequest) -> dict:
 
 @app.get("/certificates")
 def list_certificates() -> dict:
+    """Lista todos los certificados emitidos ordenados por fecha de emisión descendente."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -414,6 +467,7 @@ def list_certificates() -> dict:
 
 @app.get("/audit")
 def list_audit() -> dict:
+    """Devuelve la bitácora de auditoría con los eventos donde falló la firma o el encadenamiento."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(

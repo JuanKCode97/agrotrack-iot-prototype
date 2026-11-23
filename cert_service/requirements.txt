@@ -1,4 +1,15 @@
+# Framework web asíncrono de alto rendimiento para exponer 
+#los endpoints REST de certificación, pagos y auditoría.
 fastapi==0.115.0
+
+# Servidor ASGI ligero encargado de ejecutar 
+#la aplicación FastAPI en el contenedor del servicio.
 uvicorn==0.30.6
+
+# Cliente HTTP asíncrono (async/await) utilizado 
+#para consultar los eventos del trayecto en stream-processor sin bloquear el event loop.
 httpx==0.27.2
+
+# Validación estricta de esquemas y tipos de datos para las 
+#peticiones entrantes (emisión de certificados y checkout de pagos).
 pydantic==2.9.2

@@ -1,14 +1,22 @@
+# Definición de los servicios del prototipo de corte vertical de AgroTrack-IoT.
+# Docker Compose crea automáticamente una red interna donde los servicios se resuelven por nombre (ej. stream-processor).
 services:
   stream-processor:
+    # Construye la imagen desde el contexto ./stream_processor usando su Dockerfile.
     build: ./stream_processor
     container_name: agrotrack_stream_processor
     ports:
+      # Expone el puerto 8001 del contenedor hacia el host para pruebas y demostración en vivo.
       - "8001:8001"
     environment:
+      # Secreto compartido para validar firmas HMAC de eventos (en el prototipo; migrar a claves asimétricas/mTLS en producción).
       - DEVICE_SECRET=agrotrack-edge-secret-key
+      # Tiempo límite por defecto (180 s = 3 min) sin reconocimiento antes de escalar al coordinador logístico.
       - ESCALATION_TIMEOUT_SECONDS=180
     volumes:
+      # Volumen nombrado para persistir la base SQLite (stream_state.db) fuera del ciclo de vida efímero del contenedor.
       - processor_data:/data
+    # Verifica periódicamente que /health responda antes de considerar el servicio listo para dependencias.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 5s
@@ -19,11 +27,14 @@ services:
     build: ./cert_service
     container_name: agrotrack_cert_service
     ports:
+      # Expone la API de certificación, auditoría y pagos en el puerto 8002.
       - "8002:8002"
     environment:
+      # URL interna dentro de la red de Docker Compose para consultar eventos en stream-processor.
       - STREAM_PROCESSOR_URL=http://stream-processor:8001
       - DEVICE_SECRET=agrotrack-edge-secret-key
     volumes:
+      # Persiste certificates.db, audit_log, payments y los certificados PDF generados en /data.
       - cert_data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
@@ -35,19 +46,23 @@ services:
     build: ./gateway_sim
     container_name: agrotrack_gateway_sim
     ports:
+      # Expone el simulador de gateway embarcado en el puerto 8003.
       - "8003:8003"
     environment:
       - STREAM_PROCESSOR_URL=http://stream-processor:8001
       - CERT_SERVICE_URL=http://cert-service:8002
       - DEVICE_SECRET=agrotrack-edge-secret-key
     volumes:
+      # Persiste el búfer local store-and-forward (gateway_buffer.db) y el estado de cadena/red del gateway.
       - gateway_data:/data
+    # Espera a que stream-processor y cert-service pasen su healthcheck antes de iniciar gateway-sim.
     depends_on:
       stream-processor:
         condition: service_healthy
       cert-service:
         condition: service_healthy
 
+# Volúmenes persistentes administrados por Docker para conservar estado y datos entre reinicios.
 volumes:
   processor_data:
   cert_data:

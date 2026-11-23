@@ -1,3 +1,13 @@
+"""
+Simulador de Gateway Embarcado (Gateway Simulator - AgroTrack-IoT).
+
+Representa el nodo de borde en camiones o cuartos fríos que opera bajo
+conectividad celular intermitente (cortes rurales de hasta 6 horas). Guarda
+lecturas de forma persistente en SQLite (store-and-forward), firma cada evento
+encadenando hashes y retransmite en orden cronológico (`event_timestamp`) al
+restablecerse la conexión.
+"""
+
 import hashlib
 import hmac
 import json
@@ -12,6 +22,7 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+# Variables de entorno configurables en el despliegue (persistencia local, URLs de servicios y secreto).
 DB_PATH = os.getenv("GATEWAY_DB_PATH", "/data/gateway_buffer.db")
 STREAM_PROCESSOR_URL = os.getenv("STREAM_PROCESSOR_URL", "http://localhost:8001")
 CERT_SERVICE_URL = os.getenv("CERT_SERVICE_URL", "http://localhost:8002")
@@ -21,6 +32,8 @@ app = FastAPI(title="AgroTrack-IoT Gateway Simulator")
 
 
 class TelemetryInput(BaseModel):
+    """Datos de entrada para simular una lectura capturada por los sensores del vehículo o cuarto frío."""
+
     tenant_id: str = "tenant-cundinamarca-01"
     device_id: str = "truck-001"
     trip_id: str = "trip-2026-11-19-a"
@@ -30,14 +43,19 @@ class TelemetryInput(BaseModel):
     lon: float = -74.2168
     door_open: bool = False
     event_timestamp: Optional[str] = None
+    # Permite simular en pruebas/demo un evento con firma corrupta para validar detección de manipulación.
     tamper_signature: bool = False
 
 
 class NetworkState(BaseModel):
+    """Estado de conectividad celular simulado para el gateway (`true` = en línea, `false` = sin señal)."""
+
     online: bool
 
 
 class BurstRequest(BaseModel):
+    """Parámetros para generar una ráfaga de lecturas espaciadas en el tiempo (útil para ventanas de 10 min)."""
+
     tenant_id: str = "tenant-cundinamarca-01"
     device_id: str = "truck-001"
     trip_id: str = "trip-2026-11-19-a"
@@ -52,6 +70,7 @@ class BurstRequest(BaseModel):
 
 
 def init_db() -> None:
+    """Inicializa el directorio y las tablas SQLite `state` y `telemetry_queue` para el búfer local."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -77,6 +96,7 @@ def init_db() -> None:
             )
             """
         )
+        # Estado inicial: conectividad activa y hash encadenado raíz 'GENESIS'.
         conn.execute(
             "INSERT OR IGNORE INTO state (key, value) VALUES ('online', 'true')"
         )
@@ -87,12 +107,14 @@ def init_db() -> None:
 
 
 def is_online() -> bool:
+    """Consulta si el gateway tiene enlace activo hacia el procesador de flujos."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT value FROM state WHERE key = 'online'").fetchone()
         return row[0] == "true" if row else True
 
 
 def set_online(online: bool) -> None:
+    """Actualiza el estado de conectividad del gateway (`true` o `false`)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE state SET value = ? WHERE key = 'online'",
@@ -102,6 +124,10 @@ def set_online(online: bool) -> None:
 
 
 def get_and_update_hash(canonical_payload: str) -> tuple[str, str]:
+    """Calcula la firma HMAC encadenada con `last_hash` y actualiza el hash de cadena en SQLite.
+
+    Devuelve `(prev_hash, signature)` para vincular criptográficamente cada lectura con la anterior.
+    """
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT value FROM state WHERE key = 'last_hash'").fetchone()
         prev_hash = row[0] if row else "GENESIS"
@@ -109,6 +135,7 @@ def get_and_update_hash(canonical_payload: str) -> tuple[str, str]:
         signature = hmac.new(
             DEVICE_SECRET.encode("utf-8"), message, hashlib.sha256
         ).hexdigest()
+        # Encadena el hash previo y la firma del evento actual para formar la siguiente liga de la cadena.
         new_hash = hashlib.sha256(f"{prev_hash}|{signature}".encode("utf-8")).hexdigest()
         conn.execute(
             "UPDATE state SET value = ? WHERE key = 'last_hash'", (new_hash,)
@@ -118,6 +145,7 @@ def get_and_update_hash(canonical_payload: str) -> tuple[str, str]:
 
 
 def store_reading(item: TelemetryInput) -> dict:
+    """Genera el evento con `event_id` único, firma encadenada y lo guarda en `telemetry_queue` (`sent=0`)."""
     event_id = str(uuid.uuid4())
     event_ts = item.event_timestamp or datetime.now(timezone.utc).isoformat()
     created_at = datetime.now(timezone.utc).isoformat()
@@ -136,6 +164,7 @@ def store_reading(item: TelemetryInput) -> dict:
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     prev_hash, signature = get_and_update_hash(canonical)
+    # Si `tamper_signature` está activo, corrompe la firma para demostrar detección de manipulación.
     if item.tamper_signature:
         signature = "0" * 64
 
@@ -170,6 +199,11 @@ def store_reading(item: TelemetryInput) -> dict:
 
 
 async def flush_queue() -> dict:
+    """Retransmite hacia `/ingest` los eventos pendientes (`sent=0`) ordenados por `event_timestamp`.
+
+    Si el gateway está fuera de línea o falla la conexión HTTP, detiene el lote sin marcar como
+    enviados los eventos no confirmados, preservando la cola local para el próximo reintento.
+    """
     if not is_online():
         return {"flushed": 0, "status": "offline_buffered"}
 
@@ -224,11 +258,13 @@ async def flush_queue() -> dict:
 
 @app.on_event("startup")
 def on_startup() -> None:
+    """Inicializa la base de datos local del gateway al arrancar el servicio."""
     init_db()
 
 
 @app.get("/health")
 def health() -> dict:
+    """Entrega el estado de red del gateway y el conteo de eventos pendientes y totales."""
     with sqlite3.connect(DB_PATH) as conn:
         pending = conn.execute(
             "SELECT COUNT(*) FROM telemetry_queue WHERE sent = 0"
@@ -244,6 +280,7 @@ def health() -> dict:
 
 @app.post("/network")
 async def update_network(state: NetworkState) -> dict:
+    """Cambia la conectividad del gateway y, al volver en línea (`online=true`), dispara `flush_queue()`."""
     set_online(state.online)
     flush_result = await flush_queue() if state.online else {"flushed": 0}
     return {"online": state.online, "flush_result": flush_result}
@@ -251,6 +288,7 @@ async def update_network(state: NetworkState) -> dict:
 
 @app.post("/telemetry")
 async def receive_telemetry(item: TelemetryInput) -> dict:
+    """Registra una lectura en el búfer local y la envía si hay red; si está offline, la deja en cola."""
     record = store_reading(item)
     if is_online():
         flush_res = await flush_queue()
@@ -260,6 +298,7 @@ async def receive_telemetry(item: TelemetryInput) -> dict:
 
 @app.post("/telemetry/burst")
 async def simulate_burst(req: BurstRequest) -> dict:
+    """Genera `count` lecturas escalonadas en el tiempo y las envía si el gateway está en línea."""
     base_time = time.time() - (req.start_minutes_ago * 60)
     created = 0
     for i in range(req.count):
@@ -287,4 +326,5 @@ async def simulate_burst(req: BurstRequest) -> dict:
 
 @app.post("/flush")
 async def manual_flush() -> dict:
+    """Fuerza manualmente el envío de los eventos pendientes en cola si hay conectividad."""
     return await flush_queue()
